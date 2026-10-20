@@ -20,12 +20,15 @@ import {
   tail,
   nextPollDelay,
   POLL_START_MS,
+  assessRender,
+  RenderAssessment,
 } from "./lib/bridge-core.js";
 import { collectPresetFiles } from "./lib/preset-scan.js";
 import { analyzeWavBuffer, WavAnalysis } from "./lib/wav.js";
 import {
   buildFrameContent,
   isCompletePng,
+  progressiveSampleFractions,
   type FrameFile,
   type ContentBlock,
 } from "./lib/see-frame.js";
@@ -2558,7 +2561,7 @@ server.tool(
 
 // Bump this whenever the bridge .jsx protocol changes, and keep it in sync with
 // BRIDGE_VERSION in src/scripts/mcp-bridge-auto.jsx. check-bridge warns on mismatch.
-const EXPECTED_BRIDGE_VERSION = "1.13.0-mcp-enhanced";
+const EXPECTED_BRIDGE_VERSION = "1.14.0-local.1-mcp-enhanced";
 
 server.tool(
   "check-bridge",
@@ -3738,7 +3741,7 @@ server.tool(
       .min(64)
       .max(4096)
       .optional()
-      .describe("Width of the whole grid image in pixels (default 1024)."),
+      .describe("Width of the whole grid image in pixels (default 512)."),
     timeoutMs: z
       .number()
       .int()
@@ -3747,7 +3750,7 @@ server.tool(
       .optional()
       .describe("Wait time in ms (default 90000)."),
   },
-  async ({ comp, count = 9, maxWidth = 1024, timeoutMs = 90000 }) => {
+  async ({ comp, count = 9, maxWidth = 512, timeoutMs = 90000 }) => {
     try {
       const raw = await sendBridgeCommand(
         "contactSheet",
@@ -3777,6 +3780,42 @@ server.tool(
         content: [{ type: "text", text: `Error building contact sheet: ${String(error)}` }],
         isError: true,
       };
+    }
+  },
+);
+
+server.tool(
+  "preview-footage",
+  "Quickly inspect a source video without rendering the full clip: return one labeled contact sheet sampled in progressive priority order. The first pass uses the start, end, midpoint, quarter, and three-quarter frames; request count 9, 17, or 33 to refine the scan.",
+  {
+    filePath: z.string().min(1).describe("Absolute path to the source video file."),
+    count: z.number().int().min(5).max(33).optional().describe("Number of prioritized samples (default 5; refine with 9, 17, or 33)."),
+    maxWidth: z.number().int().min(64).max(4096).optional().describe("Maximum contact-sheet width in pixels (default 512)."),
+    timeoutMs: z.number().int().positive().max(600000).optional().describe("Wait time in milliseconds (default 90000)."),
+  },
+  async ({ filePath, count = 5, maxWidth = 512, timeoutMs = 90000 }) => {
+    try {
+      const fractions = progressiveSampleFractions(count);
+      const raw = await sendBridgeCommand(
+        "previewFootage",
+        { filePath, count: fractions.length, fractions, maxWidth },
+        timeoutMs,
+        300,
+      );
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return { content: [{ type: "text", text: raw }], isError: true };
+      }
+      const sheet = parsed?.path ? [{ path: parsed.path, caption: `Video contact sheet (${parsed.count || fractions.length} samples, ${parsed.width || maxWidth}px wide)` }] : [];
+      const result = await imageResultFromPaths(raw, sheet, `Video preview: ${parsed?.fileName || filePath}`);
+      if (parsed?.samples?.length) {
+        result.content.splice(1, 0, { type: "text", text: `Scan order: ${parsed.samples.map((s: any) => `${s.fractionLabel} (${s.timecode})`).join(", ")}` });
+      }
+      return result;
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error previewing footage: ${String(error)}` }], isError: true };
     }
   },
 );
@@ -3977,8 +4016,55 @@ interface RenderJob {
   output: string;
   logPath: string;
   startedAt: string;
+  // Set once the launcher's exit has been observed. A job whose launcher is gone
+  // is not necessarily done: see assessRender.
+  exited: boolean;
+  exitCode?: number | null;
+  signal?: string | null;
 }
 const runningRenders = new Map<number, RenderJob>();
+
+function assessRenderJob(job: RenderJob): RenderAssessment {
+  let logText = "";
+  try {
+    logText = fs.readFileSync(job.logPath, "utf8");
+  } catch {
+    /* no log yet */
+  }
+  let outputSize: number | null = null;
+  let outputMtimeMs: number | null = null;
+  try {
+    const st = fs.statSync(job.output);
+    outputSize = st.size;
+    outputMtimeMs = st.mtimeMs;
+  } catch {
+    /* no output file */
+  }
+  let sequenceFileCount: number | null = null;
+  if (/\[#+\]/.test(job.output)) {
+    sequenceFileCount = 0;
+    const escaped = path.basename(job.output).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp("^" + escaped.replace(/\\\[#+\\\]/, "[0-9]+") + "$");
+    try {
+      for (const name of fs.readdirSync(path.dirname(job.output))) {
+        if (!pattern.test(name)) continue;
+        const st = fs.statSync(path.join(path.dirname(job.output), name));
+        if (st.isFile() && st.size > 0 && st.mtimeMs >= Date.parse(job.startedAt) - 1000) sequenceFileCount++;
+      }
+    } catch { /* missing or unreadable sequence */ }
+  }
+  return assessRender({
+    sequenceFileCount,
+    alive: !job.exited,
+    exitCode: job.exitCode,
+    signal: job.signal,
+    logText,
+    outputPath: job.output,
+    outputSize,
+    outputMtimeMs,
+    startedAtMs: Date.parse(job.startedAt),
+  });
+}
 
 async function getOpenProjectPath(): Promise<string | null> {
   const raw = await sendBridgeCommand("getProjectInfo", {}, 6000, 250);
@@ -4120,32 +4206,45 @@ server.tool(
       const logPath = path.join(getAETempDir(), `aerender-${nextCommandId()}.log`);
       const out = fs.openSync(logPath, "a");
       const child = spawn(aerenderPath, args, { detached: true, stdio: ["ignore", out, out] });
-      child.unref();
       const pid = child.pid || -1;
-      if (pid > 0)
-        runningRenders.set(pid, {
-          pid,
-          comp: p.compName,
-          output: p.outputPath,
-          logPath,
-          startedAt: new Date().toISOString(),
-        });
+      const job: RenderJob = {
+        pid,
+        comp: p.compName,
+        output: p.outputPath,
+        logPath,
+        startedAt: new Date().toISOString(),
+        exited: false,
+      };
+      child.on("exit", (code, signal) => {
+        job.exited = true;
+        job.exitCode = code;
+        job.signal = signal;
+      });
+      child.on("error", () => {
+        job.exited = true;
+        job.exitCode = -1;
+      });
+      child.unref();
+      if (pid > 0) runningRenders.set(pid, job);
 
       if (p.waitMs && p.waitMs > 0) {
         const start = Date.now();
         while (Date.now() - start < p.waitMs) {
-          if (!pidAlive(pid)) break;
+          if (job.exited || !pidAlive(pid)) break;
           await new Promise((r) => setTimeout(r, 1000));
         }
-        const alive = pidAlive(pid);
-        if (!alive) runningRenders.delete(pid);
+        const verdict = assessRenderJob(job);
+        if (verdict.state !== "running") runningRenders.delete(pid);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
-                  status: alive ? "running" : "finished",
+                  status: verdict.state,
+                  ...(verdict.reason ? { error: verdict.reason } : {}),
+                  framesRendered: verdict.framesRendered,
+                  ...(job.exited ? { exitCode: job.exitCode, signal: job.signal } : {}),
                   pid,
                   comp: p.compName,
                   output: p.outputPath,
@@ -4159,6 +4258,7 @@ server.tool(
               ),
             },
           ],
+          ...(verdict.state === "failed" ? { isError: true } : {}),
         };
       }
 
@@ -4194,7 +4294,7 @@ server.tool(
 
 server.tool(
   "render-status",
-  "Check background aerender renders started with render-aerender: which are still running, which finished, and the tail of each render log.",
+  "Check background aerender renders started with render-aerender: which are still running, which finished, which failed and why, and the tail of each render log.",
   {
     pid: z
       .number()
@@ -4228,14 +4328,17 @@ server.tool(
         };
       }
       const renders = jobs.map((j) => {
-        const alive = pidAlive(j.pid);
-        if (!alive) runningRenders.delete(j.pid);
+        const verdict = assessRenderJob(j);
+        if (verdict.state !== "running") runningRenders.delete(j.pid);
         return {
           pid: j.pid,
           comp: j.comp,
           output: j.output,
           startedAt: j.startedAt,
-          state: alive ? "running" : "finished",
+          state: verdict.state,
+          ...(verdict.reason ? { error: verdict.reason } : {}),
+          framesRendered: verdict.framesRendered,
+          ...(j.exited ? { exitCode: j.exitCode, signal: j.signal } : {}),
           logTail: tailFile(j.logPath),
         };
       });

@@ -50,6 +50,7 @@
     "clean": "node -e \"require('fs').rmSync('build',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc && node -e \"require('fs').cpSync('src/scripts','build/scripts',{recursive:true})\"",
     "start": "node build/index.js",
+    "build:cep": "node scripts/build-cep.mjs",
     "install-bridge": "node install-bridge.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

@@ -1,4 +1,4 @@
-﻿
+
 
 
 
@@ -2928,7 +2928,7 @@ var currentCommandId = "";
 // command under concurrent/rapid tool dispatch). The server matches results purely
 // by _commandId, so AE never needs to write the command file at all.
 var lastProcessedCommandId = "";
-var BRIDGE_VERSION = "1.13.0-mcp-enhanced";
+var BRIDGE_VERSION = "1.14.0-local.1-mcp-enhanced";
 // Pure read-only commands: they never mutate the project, so we skip the undo
 // group for them (no empty "MCP: ping" entries cluttering Edit > Undo History).
 var READ_ONLY_COMMANDS = {
@@ -3559,6 +3559,85 @@ function getCompFull(args) {
 // avoids any collision with a leftover from a previously crashed call).
 var _seeFrameSeq = 0;
 
+// BEGIN MCP synchronous preview renderer
+// saveFrameToPng on AE 26.2 / 32 bpc scales SDR white to about 0.1 in
+// the saved PNG. Render through an explicit 8-bit PNG output module instead:
+// compositing still uses the project's precision, including 32-bpc HDR effects.
+// Rendering is synchronous, so callers can import the completed PNG immediately.
+var _mcpPreviewRenderSeq = 0;
+function _renderPreviewPng(comp, time, outputPath, motionBlur) {
+    var queue = app.project.renderQueue;
+    if (queue.rendering) throw new Error("Cannot capture a preview while the render queue is rendering.");
+    var output = new File(outputPath);
+    var folder = new Folder(output.fsName + ".render-" + new Date().getTime() + "-" + (++_mcpPreviewRenderSeq));
+    var paused = [], job = null, failure = null, cleanupErrors = [], createdFolder = false;
+    var frameDuration = comp.frameDuration;
+    var lastFrame = Math.max(0, Math.ceil(comp.duration / frameDuration - 0.000001) - 1);
+    var frame = Math.max(0, Math.min(lastFrame, Math.floor(time / frameDuration + 0.000001)));
+    var capturedTime = frame * frameDuration;
+    try {
+        if (folder.exists || !folder.create()) throw new Error("Cannot create preview render folder: " + folder.fsName);
+        createdFolder = true;
+        // DONE items may report render=true, but their render flag cannot be set.
+        // Only QUEUED items can run; temporarily disable exactly those items.
+        for (var i = 1; i <= queue.numItems; i++) {
+            var item = queue.item(i);
+            if (item.status === RQItemStatus.QUEUED) {
+                item.render = false;
+                paused.push(item);
+            }
+        }
+        job = queue.items.add(comp);
+        job.setSettings({ "Quality": "Best", "Resolution": "Full", "Color Depth": "Current Settings", "Field Render": "Off", "Skip Existing Files": "false" });
+        if (typeof motionBlur === "boolean") {
+            job.setSettings({ "Motion Blur": motionBlur ? "On for Checked Layers" : "Off for All Layers" });
+        }
+        job.timeSpanStart = capturedTime;
+        job.timeSpanDuration = frameDuration;
+        job.skipFrames = 0;
+        // AE's built-in still-output template; do not borrow a user template
+        // that may contain resize, crop, post-render, or output-format settings.
+        job.outputModule(1).applyTemplate("_HIDDEN X-Factor 8");
+        var module = job.outputModule(1);
+        var settings = module.getSettings(GetSettingsFormat.STRING);
+        if (settings.Format !== "PNG Sequence" || settings.Depth !== "Millions of Colors+" || settings.Channels !== "RGB + Alpha" || settings.Color !== "Straight (Unmatted)") {
+            throw new Error("The built-in preview output template must be 8-bit straight-alpha PNG Sequence.");
+        }
+        module.setSettings({ "Output Audio": "Off", "Crop": "false", "Resize": "false", "Use Region of Interest": "false", "Post-Render Action": "None" });
+        // setSettings can invalidate an OutputModule reference; reacquire it.
+        job.outputModule(1).file = new File(folder.fsName + "/frame_[#####].png");
+        try { job.queueItemNotify = false; } catch (notifyError) {}
+        job.render = true;
+        queue.render();
+        if (job.status !== RQItemStatus.DONE) throw new Error("Preview render did not complete (status " + job.status + ").");
+        var files = folder.getFiles("frame_*.png");
+        if (files.length !== 1 || !(files[0] instanceof File) || !files[0].copy(output.fsName)) {
+            throw new Error("Preview render did not produce exactly one readable PNG: " + output.fsName);
+        }
+    } catch (error) {
+        failure = error;
+    } finally {
+        if (job) { try { job.remove(); } catch (removeError) { cleanupErrors.push(String(removeError)); } }
+        for (var j = 0; j < paused.length; j++) {
+            try { paused[j].render = true; } catch (restoreError) { cleanupErrors.push(String(restoreError)); }
+        }
+        // This directory was created solely for this capture. Never recurse.
+        if (createdFolder && folder.exists) {
+            var leftovers = folder.getFiles();
+            for (var k = 0; k < leftovers.length; k++) {
+                if (leftovers[k] instanceof File) leftovers[k].remove();
+            }
+            folder.remove();
+        }
+    }
+    if (cleanupErrors.length) throw new Error("Could not restore the preview render queue: " + cleanupErrors.join("; ") + (failure ? "; " + failure : ""));
+    if (failure) throw failure;
+    return capturedTime;
+}
+
+// END MCP synchronous preview renderer
+
+
 // Remove any leftover "__mcp_tmp__" comps from a previous crashed seeFrame call
 // so the user's project is never polluted with our temporaries.
 function _sweepMcpTempComps() {
@@ -3572,7 +3651,7 @@ function _sweepMcpTempComps() {
     } catch (e) {}
 }
 
-// Import a file, retrying briefly. saveFrameToPng writes a PNG synchronously, but
+// Import a completed preview file, retrying briefly. Rendering is synchronous, but
 // on Windows the OS write-lock/flush can lag, so an immediate importFile fails
 // with "File exists but couldn't be open for reading". A short retry loop lets the
 // lock release. Only used for PNGs we just wrote (contact-sheet / match-reference).
@@ -3587,6 +3666,22 @@ function _importWithRetry(file) {
         }
     }
     throw lastErr;
+}
+
+// see-frame: render one or more frames of a comp to PNG and return their paths so
+// the Node side can hand the actual pixels back to the model. Renders a downscaled
+// nested comp when maxWidth < comp.width, so AE performs the downscale before any
+// pixels leave the app.
+function _addCompAtTime(target, comp, t) {
+    // The comp's last frame starts one frame before its end; past that the layer
+    // would already be over at time 0 and the cell would render empty.
+    var last = comp.duration - comp.frameDuration;
+    if (t > last) t = last;
+    if (t < 0) t = 0;
+    var lyr = target.layers.add(comp);
+    lyr.startTime = -t;
+    try { lyr.audioEnabled = false; } catch (e) {}
+    return lyr;
 }
 
 // see-frame: render one or more frames of a comp to PNG and return their paths so
@@ -3631,10 +3726,10 @@ function seeFrame(args) {
             var scalePct = (tw / comp.width) * 100;
             try { nested.property("ADBE Transform Group").property("ADBE Scale").setValue([scalePct, scalePct]); } catch (e) {}
             try { nested.property("ADBE Transform Group").property("ADBE Position").setValue([tw / 2, th / 2]); } catch (e) {}
-            try { nested.collapseTransformation = true; } catch (e) {}
+            // Render source effects before downscaling the resulting image.
             target = tempComp;
         }
-        try { target.motionBlur = motionBlur; } catch (e) {}
+
 
         var folder = getBridgeFolder().fsName;
         var frames = [];
@@ -3643,8 +3738,8 @@ function seeFrame(args) {
             _seeFrameSeq++;
             var path = folder + "/__mcp_seeframe_" + _seeFrameSeq + "_" + i + ".png";
             try {
-                target.saveFrameToPng(times[i], new File(path));
-                frames.push({ time: times[i], path: path, w: target.width, h: target.height });
+                var capturedTime = _renderPreviewPng(target, times[i], path, motionBlur);
+                frames.push({ time: capturedTime, path: path, w: target.width, h: target.height });
             } catch (fe) {
                 note = (note ? note + " " : "") + "Frame at t=" + times[i] + "s failed: " + fe.toString();
             }
@@ -3670,8 +3765,6 @@ function seeFrame(args) {
 // polluted.
 function contactSheet(args) {
     var gridComp = null;
-    var importedItems = [];
-    var scratch = [];
     try {
         _sweepMcpTempComps();
         var comp = _resolveComp(args);
@@ -3697,16 +3790,8 @@ function contactSheet(args) {
         gridComp = app.project.items.addComp("__mcp_tmp__contact", gw, gh, 1, 1, comp.frameRate);
 
         for (var i = 0; i < count; i++) {
-            _seeFrameSeq++;
             var t = (dur * (i + 0.5)) / count;
-            var pngPath = folder + "/__mcp_cs_" + _seeFrameSeq + "_" + i + ".png";
-            comp.saveFrameToPng(t, new File(pngPath));
-            scratch.push(pngPath);
-
-            var foot = _importWithRetry(new File(pngPath));
-            importedItems.push(foot);
-
-            var lyr = gridComp.layers.add(foot);
+            var lyr = _addCompAtTime(gridComp, comp, t);
             var col = i % cols;
             var row = Math.floor(i / cols);
             var sx = (cellW / comp.width) * 100;
@@ -3719,6 +3804,9 @@ function contactSheet(args) {
                 var td = tl.property("ADBE Text Properties").property("ADBE Text Document").value;
                 td.fontSize = Math.max(10, Math.round(cellH * 0.12));
                 td.fillColor = [1, 1, 1];
+                // New text inherits the alignment last used in AE; force left so the
+                // label starts at the cell corner instead of being cut off by it.
+                td.justification = ParagraphJustification.LEFT_JUSTIFY;
                 tl.property("ADBE Text Properties").property("ADBE Text Document").setValue(td);
                 tl.property("ADBE Transform Group").property("ADBE Position").setValue([col * cellW + 6, row * cellH + cellH - 6]);
             } catch (te) {}
@@ -3726,15 +3814,131 @@ function contactSheet(args) {
 
         _seeFrameSeq++;
         var outPath = folder + "/__mcp_cs_grid_" + _seeFrameSeq + ".png";
-        gridComp.saveFrameToPng(0, new File(outPath));
+        _renderPreviewPng(gridComp, 0, outPath);
 
         return JSON.stringify({ status: "success", compName: comp.name, path: outPath, count: count });
     } catch (e) {
         return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
     } finally {
         if (gridComp) { try { gridComp.remove(); } catch (ge) {} }
+    }
+}
+
+// match-reference: import an on-disk reference image, nest the comp at the
+// requested time, and use AE's DIFFERENCE blend mode as a dependency-free diff
+// engine. Returns a side-by-side PNG and a difference-map PNG.
+function previewFootage(args) {
+    var sourceComp = null, gridComp = null, importedFootage = null;
+    var importedItems = [], scratch = [], outPath = null, completed = false;
+    try {
+        _sweepMcpTempComps();
+        if (!args || !args.filePath) return JSON.stringify({ status: "error", error: "filePath is required." });
+        var file = new File(args.filePath);
+        if (!file.exists) return JSON.stringify({ status: "error", error: "Video file not found: " + args.filePath });
+
+        var targetPath = file.fsName.replace(/\\/g, "/").toLowerCase();
+        var footage = null;
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var candidate = app.project.item(i);
+            if (!(candidate instanceof FootageItem) || !(candidate.mainSource instanceof FileSource)) continue;
+            try {
+                var candidatePath = candidate.mainSource.file.fsName.replace(/\\/g, "/").toLowerCase();
+                if (candidatePath === targetPath) { footage = candidate; break; }
+            } catch (pathErr) {}
+        }
+        if (!footage) {
+            try {
+                importedFootage = _importWithRetry(file);
+                footage = importedFootage;
+                importedItems.push(importedFootage);
+            } catch (importErr) {
+                return JSON.stringify({ status: "error", error: "After Effects could not import this video: " + importErr.toString() });
+            }
+        }
+
+        var width = footage.width, height = footage.height;
+        var duration = footage.duration, fps = footage.frameRate;
+        if (footage.hasVideo === false || !(width > 0) || !(height > 0) || !(duration > 0) || !(fps > 0)) {
+            return JSON.stringify({ status: "error", error: "The selected file does not contain a supported video stream." });
+        }
+
+        var requested = (args.fractions && args.fractions.length) ? args.fractions : [0, 1, 0.5, 0.25, 0.75];
+        var count = Math.min(Math.max(Math.round(args.count || requested.length), 5), 33);
+        if (requested.length > count) requested = requested.slice(0, count);
+        var frameCount = Math.max(1, Math.floor(duration * fps + 0.00001));
+        var lastFrame = frameCount - 1;
+        var sampleFrames = [], seenFrames = {};
+        for (var s = 0; s < requested.length; s++) {
+            var fraction = Math.max(0, Math.min(1, Number(requested[s]) || 0));
+            var frameIndex = Math.round(lastFrame * fraction);
+            if (frameIndex < 0) frameIndex = 0;
+            if (frameIndex > lastFrame) frameIndex = lastFrame;
+            if (seenFrames[frameIndex]) continue;
+            seenFrames[frameIndex] = true;
+            sampleFrames.push({ frame: frameIndex, fraction: fraction, time: frameIndex / fps });
+        }
+        if (!sampleFrames.length) return JSON.stringify({ status: "error", error: "No unique source frames were available to sample." });
+
+        var sheetW = (typeof args.maxWidth === "number") ? args.maxWidth : 512;
+        if (sheetW < 64) sheetW = 64;
+        var cols = Math.ceil(Math.sqrt(sampleFrames.length));
+        var rows = Math.ceil(sampleFrames.length / cols);
+        var cellW = Math.round((sheetW / cols) / 2) * 2; if (cellW < 2) cellW = 2;
+        var cellH = Math.round((cellW * height / width) / 2) * 2; if (cellH < 2) cellH = 2;
+        var folder = getBridgeFolder().fsName;
+        sourceComp = app.project.items.addComp("__mcp_tmp__preview_source", width, height, 1, duration, fps);
+        var sourceLayer = sourceComp.layers.add(footage);
+        try { sourceLayer.audioEnabled = false; } catch (audioErr) {}
+        gridComp = app.project.items.addComp("__mcp_tmp__preview_grid", cellW * cols, cellH * rows, 1, 1, fps);
+
+        var samples = [];
+        for (var j = 0; j < sampleFrames.length; j++) {
+            var sample = sampleFrames[j];
+            var col = j % cols, row = Math.floor(j / cols);
+            var layer = _addCompAtTime(gridComp, sourceComp, sample.time);
+            var scale = (cellW / width) * 100;
+            layer.property("ADBE Transform Group").property("ADBE Scale").setValue([scale, scale]);
+            layer.property("ADBE Transform Group").property("ADBE Position").setValue([col * cellW + cellW / 2, row * cellH + cellH / 2]);
+
+            var denom = 1, numer = 0;
+            if (sample.fraction !== 0 && sample.fraction !== 1) {
+                for (var d = 2; d <= 32; d *= 2) {
+                    var scaledFraction = sample.fraction * d;
+                    if (Math.abs(scaledFraction - Math.round(scaledFraction)) < 0.000001) { denom = d; numer = Math.round(scaledFraction); break; }
+                }
+            } else { numer = sample.fraction === 1 ? 1 : 0; }
+            var fractionLabel = numer + "/" + denom;
+            var totalFrames = Math.round(sample.time * fps);
+            var hh = Math.floor(totalFrames / fps / 3600);
+            var mm = Math.floor((totalFrames / fps - hh * 3600) / 60);
+            var ss = Math.floor(totalFrames / fps - hh * 3600 - mm * 60);
+            var ff = totalFrames % Math.round(fps);
+            var timecode = (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + ":" + (ss < 10 ? "0" : "") + ss + ":" + (ff < 10 ? "0" : "") + ff;
+            try {
+                var label = gridComp.layers.addText(fractionLabel + "  " + timecode);
+                var textDoc = label.property("ADBE Text Properties").property("ADBE Text Document").value;
+                textDoc.fontSize = Math.max(8, Math.min(12, Math.floor(cellW / 18)));
+                textDoc.fillColor = [1, 1, 1];
+                textDoc.justification = ParagraphJustification.LEFT_JUSTIFY;
+                label.property("ADBE Text Properties").property("ADBE Text Document").setValue(textDoc);
+                label.property("ADBE Transform Group").property("ADBE Position").setValue([col * cellW + 4, row * cellH + cellH - 4]);
+            } catch (labelErr) {}
+            samples.push({ fraction: sample.fraction, fractionLabel: fractionLabel, time: sample.time, timecode: timecode, frame: sample.frame });
+        }
+
+        _seeFrameSeq++;
+        outPath = folder + "/__mcp_preview_grid_" + _seeFrameSeq + ".png";
+        _renderPreviewPng(gridComp, 0, outPath);
+        completed = true;
+        return JSON.stringify({ status: "success", fileName: file.name, path: outPath, count: samples.length, width: Math.min(sheetW, cellW * cols), samples: samples });
+    } catch (e) {
+        return JSON.stringify({ status: "error", error: e.toString(), line: (e.line !== undefined ? e.line : null) });
+    } finally {
+        if (gridComp) { try { gridComp.remove(); } catch (ge) {} }
+        if (sourceComp) { try { sourceComp.remove(); } catch (sce) {} }
         for (var k = 0; k < importedItems.length; k++) { try { importedItems[k].remove(); } catch (ie) {} }
-        for (var s = 0; s < scratch.length; s++) { try { var f = new File(scratch[s]); if (f.exists) f.remove(); } catch (se) {} }
+        for (var p = 0; p < scratch.length; p++) { try { var frameFile = new File(scratch[p]); if (frameFile.exists) frameFile.remove(); } catch (fe) {} }
+        if (!completed && outPath) { try { var outputFile = new File(outPath); if (outputFile.exists) outputFile.remove(); } catch (oe) {} }
     }
 }
 
@@ -3744,7 +3948,6 @@ function contactSheet(args) {
 function matchReference(args) {
     var sbsComp = null, diffComp = null;
     var importedItems = [];
-    var scratch = [];
     try {
         _sweepMcpTempComps();
         var comp = _resolveComp(args);
@@ -3758,16 +3961,9 @@ function matchReference(args) {
         var t = (typeof args.time === "number") ? args.time : comp.duration / 2;
         if (t < 0) t = 0; if (t > comp.duration) t = comp.duration;
 
-        // Render the current comp frame and import it + the reference as footage.
-        _seeFrameSeq++;
-        var curPath = folder + "/__mcp_mr_cur_" + _seeFrameSeq + ".png";
-        comp.saveFrameToPng(t, new File(curPath));
-        scratch.push(curPath);
-
+        // Import the reference as footage; the comp itself is nested at time t.
         var refFoot = _importWithRetry(refFile);
         importedItems.push(refFoot);
-        var curFoot = _importWithRetry(new File(curPath));
-        importedItems.push(curFoot);
 
         var rw = refFoot.width, rh = refFoot.height;
 
@@ -3775,26 +3971,26 @@ function matchReference(args) {
         sbsComp = app.project.items.addComp("__mcp_tmp__sbs", rw * 2, rh, 1, 1, comp.frameRate);
         var rL = sbsComp.layers.add(refFoot);
         rL.property("ADBE Transform Group").property("ADBE Position").setValue([rw / 2, rh / 2]);
-        var cR = sbsComp.layers.add(curFoot);
-        var csx = (rw / curFoot.width) * 100, csy = (rh / curFoot.height) * 100;
+        var cR = _addCompAtTime(sbsComp, comp, t);
+        var csx = (rw / comp.width) * 100, csy = (rh / comp.height) * 100;
         cR.property("ADBE Transform Group").property("ADBE Scale").setValue([csx, csy]);
         cR.property("ADBE Transform Group").property("ADBE Position").setValue([rw + rw / 2, rh / 2]);
         _seeFrameSeq++;
         var sbsPath = folder + "/__mcp_mr_sbs_" + _seeFrameSeq + ".png";
-        sbsComp.saveFrameToPng(0, new File(sbsPath));
+        _renderPreviewPng(sbsComp, 0, sbsPath);
 
         // (2) difference map: current over reference at reference size, DIFFERENCE blend.
         diffComp = app.project.items.addComp("__mcp_tmp__diff", rw, rh, 1, 1, comp.frameRate);
         var dRef = diffComp.layers.add(refFoot);
         dRef.property("ADBE Transform Group").property("ADBE Position").setValue([rw / 2, rh / 2]);
-        var dCur = diffComp.layers.add(curFoot);
-        var dsx = (rw / curFoot.width) * 100, dsy = (rh / curFoot.height) * 100;
+        var dCur = _addCompAtTime(diffComp, comp, t);
+        var dsx = (rw / comp.width) * 100, dsy = (rh / comp.height) * 100;
         dCur.property("ADBE Transform Group").property("ADBE Scale").setValue([dsx, dsy]);
         dCur.property("ADBE Transform Group").property("ADBE Position").setValue([rw / 2, rh / 2]);
         try { dCur.blendingMode = BlendingMode.DIFFERENCE; } catch (be) {}
         _seeFrameSeq++;
         var diffPath = folder + "/__mcp_mr_diff_" + _seeFrameSeq + ".png";
-        diffComp.saveFrameToPng(0, new File(diffPath));
+        _renderPreviewPng(diffComp, 0, diffPath);
 
         return JSON.stringify({ status: "success", compName: comp.name, sideBySidePath: sbsPath, diffPath: diffPath });
     } catch (e) {
@@ -3803,7 +3999,6 @@ function matchReference(args) {
         if (sbsComp) { try { sbsComp.remove(); } catch (e1) {} }
         if (diffComp) { try { diffComp.remove(); } catch (e2) {} }
         for (var k = 0; k < importedItems.length; k++) { try { importedItems[k].remove(); } catch (ie) {} }
-        for (var s = 0; s < scratch.length; s++) { try { var f = new File(scratch[s]); if (f.exists) f.remove(); } catch (se) {} }
     }
 }
 
@@ -4093,6 +4288,7 @@ function executeCommand(command, args) {
         "manageRenderQueue": true,
         "seeFrame": true,
         "contactSheet": true,
+        "previewFootage": true,
         "matchReference": true
     };
     var useUndoGroup = !READ_ONLY_COMMANDS[command] && !NO_UNDO_GROUP_COMMANDS[command];
@@ -4280,6 +4476,11 @@ function executeCommand(command, args) {
                 logToPanel("Calling contactSheet function...");
                 result = contactSheet(args);
                 logToPanel("Returned from contactSheet.");
+                break;
+            case "previewFootage":
+                logToPanel("Calling previewFootage function...");
+                result = previewFootage(args);
+                logToPanel("Returned from previewFootage.");
                 break;
             case "matchReference":
                 logToPanel("Calling matchReference function...");
@@ -4596,4 +4797,3 @@ if (panel instanceof Window) {
     panel.layout.resize();
     panel.onResizing = panel.onResize = function () { this.layout.resize(); };
 }
-
