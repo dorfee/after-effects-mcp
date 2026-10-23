@@ -3,6 +3,29 @@
   var el = function (id) { return document.getElementById(id); };
   var cs, timer, busy = false, stopped = false, generation = 0, lastId = 0, state, entries = [], failures = 0;
   var meta = window.MCP_BUILD || {};
+  var live = window.MCP_LIVE, requests = [];
+  live.attach(function (packet, reply) { requests.push({packet: packet, reply: reply}); drain(); });
+  function drain() {
+    if (busy || stopped || !requests.length) return;
+    var task = requests.shift(), epoch = generation;
+    busy = true; clearTimeout(timer);
+    var started = Date.now();
+    cs.evalScript(hostCall('$.global.__aeMcpCep.dispatch(' + JSON.stringify(task.packet) + ',' + lastId + ')'), function (raw) {
+      if (epoch !== generation) return;
+      busy = false;
+      try {
+        var data = JSON.parse(raw);
+        if (typeof data.result !== 'string') throw new Error('Missing host result');
+        task.reply(data.result); render(data.state);
+        el('latency').textContent = (Date.now() - started) + ' ms · live';
+      } catch (error) {
+        // Do not invent a failure before dispatch: execution may already have happened.
+        failure('Результат команды неизвестен: ' + String(error));
+        live.close();
+      }
+      if (requests.length) drain(); else schedule();
+    });
+  }
   el('version').textContent = 'Enhanced ' + meta.upstreamVersion + ' · CEP ' + meta.version;
   el('tools').textContent = meta.toolCount || '—';
   function failure(message) {
@@ -22,6 +45,7 @@
   function render(next) {
     if (next.superseded) throw new Error('Мост перезагружен. Нажмите «Переподключить».');
     state = next; lastId = next.sequence || 0;
+    live.update(next);
     el('toggle').disabled = !!next.initializationError; el('probe').disabled = false;
     el('toggle').textContent = next.active ? 'Пауза' : 'Запустить';
     el('status').textContent = next.initializationError ? 'Ошибка запуска' : next.active ? 'Мост активен' : 'Мост на паузе';
@@ -35,7 +59,7 @@
   }
   function schedule(delay) {
     clearTimeout(timer);
-    if (!stopped) timer = setTimeout(function () { call('poll', [lastId]); }, delay || (state && state.active ? 250 : 1000));
+    if (!stopped) timer = setTimeout(function () { call('poll', [lastId]); }, delay || (live.connected() ? 1000 : state && state.active ? 250 : 1000));
   }
   function hostCall(expression) {
     // Always return a value explicitly. Other extensions share the AE engine.
@@ -62,12 +86,13 @@
     cs.evalScript(hostCall(code), function (result) {
       if (epoch !== generation) return;
       busy = false;
-      try { render(parseReply(result)); failures = 0; el('latency').textContent = (Date.now() - started) + ' ms'; schedule(); }
+      try { render(parseReply(result)); failures = 0; el('latency').textContent = (Date.now() - started) + ' ms'; if (requests.length) drain(); else schedule(); }
       catch (error) { retry(error); }
     });
   }
   function initialize() {
     if (busy) return;
+    live.close(); requests = [];
     stopped = false; generation++; clearTimeout(timer); busy = true; lastId = 0; entries = []; failures = 0;
     var epoch = generation;
     el('status').textContent = 'Подключение…'; el('detail').textContent = 'Загружаем обработчики After Effects';
@@ -93,7 +118,7 @@
     el('copy-config').textContent = document.execCommand('copy') ? 'Скопировано' : 'Выделено — нажмите Ctrl+C';
     setTimeout(function () { el('copy-config').textContent = 'Копировать конфигурацию'; }, 2000);
   });
-  window.addEventListener('beforeunload', function () { stopped = true; generation++; clearTimeout(timer); });
+  window.addEventListener('beforeunload', function () { stopped = true; generation++; clearTimeout(timer); live.close(); });
   if (!window.__adobe_cep__) { failure('Откройте панель в After Effects: Window → Extensions → MCP Bridge AE.'); return; }
   try { cs = new CSInterface(); initialize(); } catch (error) { failure(String(error)); }
 })();

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ws://127.0.0.1:*; object-src 'none'">
   <title>MCP Bridge AE</title>
   <link rel="stylesheet" href="css/panel.css">
 </head>
@@ -30,6 +30,6 @@
     </details>
   </main>
   <footer><span id="host">After Effects</span><button id="reload" class="text-button">Переподключить</button></footer>
-  <script src="js/CSInterface.js"></script><script src="js/build-info.js"></script><script src="js/panel.js"></script>
+  <script src="js/CSInterface.js"></script><script src="js/build-info.js"></script><script src="js/live.js"></script><script src="js/panel.js"></script>
 </body>
 </html>

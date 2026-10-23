@@ -1,9 +1,9 @@
 window.MCP_BUILD = {
-  "version": "1.0.1",
-  "upstreamVersion": "1.13.0",
+  "version": "1.1.0",
+  "upstreamVersion": "1.14.0-local.2-fast-scenes",
   "commit": "e9ffbed9f675a3ac31a4295c83abfd1fb4a7b3f5",
-  "toolCount": 58,
-  "handlerCount": 53,
+  "toolCount": 61,
+  "handlerCount": 56,
   "tools": [
     "run-script",
     "get-results",
@@ -62,6 +62,9 @@ window.MCP_BUILD = {
     "render-queue",
     "start-render",
     "render-aerender",
-    "render-status"
+    "render-status",
+    "inspect-scene",
+    "inspect-layers",
+    "bridge-metrics"
   ]
 };

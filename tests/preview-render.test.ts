@@ -71,11 +71,14 @@ function fixture(mode = 'success') {
   const project = { bitsPerChannel: 32, renderQueue: queue };
   const context = vm.createContext({ app: { project }, File, Folder, RQItemStatus: status, GetSettingsFormat: { STRING: 1 } });
   vm.runInContext(helper, context);
-  return { invoke: (time = 0) => context._renderPreviewPng({ duration: 10, frameDuration: 1 / 30 }, time, '/scratch/capture.png', false),
+  return { invoke: (time = 0, quality = 'accurate') => context._renderPreviewPng({ duration: 10, frameDuration: 1 / 30 }, time, '/scratch/capture.png', false, quality),
     pending, done, unqueued, items, files, folders, rendered, project, copied, job: () => job };
 }
 
 describe('preview render preserves project and queue state', () => {
+  it('draft lowers render resolution while preserving project precision and 8-bit output', () => {
+    const f=fixture(); f.invoke(0,'draft'); expect(f.job().settings.Resolution).toBe('Quarter'); expect(f.project.bitsPerChannel).toBe(32);
+  });
   it('renders only its own item at project precision into explicit 8-bit PNG', () => {
     const f = fixture();
     expect(f.invoke(10)).toBeCloseTo(299 / 30);

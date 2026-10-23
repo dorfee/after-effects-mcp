@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="local.aemcp.bridge" ExtensionBundleVersion="1.0.0" ExtensionBundleName="MCP Bridge AE">
-  <ExtensionList><Extension Id="local.aemcp.bridge.panel" Version="1.0.0" /></ExtensionList>
+<ExtensionManifest Version="7.0" ExtensionBundleId="local.aemcp.bridge" ExtensionBundleVersion="1.1.0" ExtensionBundleName="MCP Bridge AE">
+  <ExtensionList><Extension Id="local.aemcp.bridge.panel" Version="1.1.0" /></ExtensionList>
   <ExecutionEnvironment>
     <HostList><Host Name="AEFT" Version="[25.0,99.9]" /></HostList>
     <LocaleList><Locale Code="All" /></LocaleList>

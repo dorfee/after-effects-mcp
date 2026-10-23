@@ -27,10 +27,10 @@ replaceOnce('cepState.status = "Command completed: " + command;', 'cepState.stat
 replaceOnce('var errorMsg = "ERROR in executeCommand', 'cepState.commandFailed = true;\n        var errorMsg = "ERROR in executeCommand');
 replaceOnce('logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);', 'throw new Error("Failed to write result file: " + resultFile.fsName);');
 const handlers = [...source.matchAll(/case\s+"([^"]+)"\s*:/g)].map(m => m[1]);
-const tools = [...read('src/index.ts').matchAll(/server\.tool\(\s*"([^"]+)"/g)].map(m => m[1]);
+const tools = [...(read('src/index.ts') + read('src/scene-tools.ts')).matchAll(/server\.tool\(\s*"([^"]+)"/g)].map(m => m[1]);
 const prefix = `// Generated from upstream handlers by scripts/build-cep.mjs.\n(function () {\nvar JSON = {}; // Private codec: never borrow a mutable JSON object from another panel.\nvar cepState = { active: true, busy: false, status: "Ready", processed: 0, errors: 0, lastCommand: "", lastAt: "", commandFailed: false, logs: [], sequence: 0 };\n`;
 const host = prefix + source + '\n' + read('cep/host-runtime.jsx') + '\n})();\n';
 fs.mkdirSync(path.join(root, 'cep/jsx'), { recursive: true });
 fs.writeFileSync(path.join(root, 'cep/jsx/bridge.jsx'), host, 'utf8');
-fs.writeFileSync(path.join(root, 'cep/js/build-info.js'), 'window.MCP_BUILD = ' + JSON.stringify({version:'1.0.1', upstreamVersion:JSON.parse(read('package.json')).version, commit:'e9ffbed9f675a3ac31a4295c83abfd1fb4a7b3f5', toolCount:tools.length, handlerCount:handlers.length, tools}, null, 2) + ';\n');
+fs.writeFileSync(path.join(root, 'cep/js/build-info.js'), 'window.MCP_BUILD = ' + JSON.stringify({version:'1.1.0', upstreamVersion:JSON.parse(read('package.json')).version, commit:'e9ffbed9f675a3ac31a4295c83abfd1fb4a7b3f5', toolCount:tools.length, handlerCount:handlers.length, tools}, null, 2) + ';\n');
 console.log(`CEP host generated: ${tools.length} MCP tools, ${handlers.length} bridge commands.`);
